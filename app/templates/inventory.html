@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>库存更正 · 回执与主备读取</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --ink: #1f2430; --muted: #6b7280;
+    --line: #e3e6ea; --accent: #2563eb;
+    --ok: #15803d; --ok-bg: #dcfce7;
+    --warn: #b45309; --warn-bg: #fef3c7;
+    --bad: #b91c1c; --bad-bg: #fee2e2;
+    --neutral: #4b5563; --neutral-bg: #e5e7eb;
+    --standby: #0d9488; --standby-bg: #ccfbf1;
+    --primary: #7c3aed; --primary-bg: #ede9fe;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.55 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+  header { padding: 18px 24px 6px; }
+  header h1 { font-size: 20px; margin: 0 0 4px; }
+  header p { margin: 0; color: var(--muted); }
+  header a { color: var(--accent); }
+  main { padding: 12px 24px 40px; max-width: 1180px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+           padding: 14px 16px; margin-bottom: 16px; }
+  .panel h2 { font-size: 16px; margin: 0 0 10px; }
+  .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  button { background: var(--accent); color: #fff; border: 0; border-radius: 6px;
+           padding: 7px 16px; font-size: 14px; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.secondary { background: #fff; color: var(--accent); border: 1px solid var(--accent); }
+  button.warn { background: var(--warn); }
+  button.good { background: var(--ok); }
+  select, input[type=number], input[type=text] {
+    padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; }
+  input[type=number] { width: 92px; }
+  .hint { color: var(--muted); font-size: 12.5px; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid var(--line); padding: 5px 8px; text-align: left;
+           vertical-align: top; font-size: 12.5px; }
+  th { background: #f1f3f6; font-weight: 600; }
+  .badge { display: inline-block; border-radius: 999px; padding: 1px 10px; font-size: 12px;
+           font-weight: 600; white-space: nowrap; }
+  .badge.ok { color: var(--ok); background: var(--ok-bg); }
+  .badge.warn { color: var(--warn); background: var(--warn-bg); }
+  .badge.bad { color: var(--bad); background: var(--bad-bg); }
+  .badge.neutral { color: var(--neutral); background: var(--neutral-bg); }
+  .badge.standby { color: var(--standby); background: var(--standby-bg); }
+  .badge.primary { color: var(--primary); background: var(--primary-bg); }
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: 2px 14px;
+        font-size: 12.5px; margin-top: 8px; }
+  .kv dt { color: var(--muted); } .kv dd { margin: 0;
+        font-family: ui-monospace, Menlo, Consolas, monospace; word-break: break-all; }
+  .receipt-box { background: #fbfbfc; border: 1px dashed var(--line); border-radius: 8px;
+                 padding: 10px 12px; margin-top: 8px; }
+  textarea { width: 100%; min-height: 64px; font: 12px/1.45 ui-monospace, Menlo, Consolas, monospace;
+             border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px;
+             background: #fbfbfc; resize: vertical; word-break: break-all; }
+  .result { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-top: 12px; }
+  .result.standby { border-left: 5px solid var(--standby); }
+  .result.primary { border-left: 5px solid var(--primary); }
+  .big { font-size: 26px; font-weight: 700; }
+  .err { color: var(--bad); }
+  .error-banner { background: var(--bad-bg); color: var(--bad); border: 1px solid var(--bad);
+                  border-radius: 8px; padding: 10px 14px; margin: 10px 0; }
+  .muted { color: var(--muted); }
+  #status { color: var(--muted); }
+  .flash { animation: flash 0.8s ease-out; }
+  @keyframes flash { from { background: var(--warn-bg); } to { background: transparent; } }
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 860px) { .two-col { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>库存更正 · 回执与主备读取</h1>
+  <p>更正提交到 <b>主库</b>，拿到带提交位点的回执；凭回执查商品时优先读 <b>备库</b>，
+     确认备库已回放到该提交才返回。连接、等回放、取数共用一个可设时限，超时或备库不可用则改读主库。
+     页面标明结果来源。 <a href="/">← 返回并发写入观测台</a></p>
+</header>
+<main>
+
+  <section class="panel">
+    <h2>备库状态</h2>
+    <div class="row" style="margin-top:0">
+      <span id="standbyBadge" class="badge neutral">检查中…</span>
+      <span class="hint" id="standbyDetail"></span>
+    </div>
+    <dl class="kv" id="standbyKv"></dl>
+    <div class="row">
+      <button type="button" class="warn" id="pauseReplay">暂停备库回放</button>
+      <button type="button" class="good" id="resumeReplay">恢复备库回放</button>
+      <span class="hint" id="replayStatus"></span>
+    </div>
+    <div class="hint">暂停回放后，主库仍可提交更正，但备库会停在上一个回放位点；
+      此时凭新回执查商品会等不到追平，时限到期后回落主库。恢复回放即可看到备库结果。</div>
+  </section>
+
+  <div class="two-col">
+    <section class="panel">
+      <h2>1. 更正余量（写主库）</h2>
+      <div class="row" style="margin-top:0">
+        <label for="product">商品：</label>
+        <select id="product"></select>
+        <button type="button" class="secondary" id="refreshProducts">刷新库存</button>
+      </div>
+      <div class="row">
+        <label for="quantity">更正为余量：</label>
+        <input id="quantity" type="number" min="0" max="1000000" step="1" value="0">
+        <button type="button" id="submitCorrection">提交更正</button>
+        <span id="status"></span>
+      </div>
+      <div id="correctionOut"></div>
+    </section>
+
+    <section class="panel">
+      <h2>2. 凭回执查商品（先备库）</h2>
+      <label class="hint" for="token">回执令牌（提交更正后自动填入，也可粘贴之前的回执）</label>
+      <textarea id="token" placeholder="eyJ..."></textarea>
+      <div class="row">
+        <label for="readTimeout">共用时限（秒）：</label>
+        <input id="readTimeout" type="number" min="0.1" max="30" step="0.1" value="1">
+        <button type="button" id="readByReceipt">按回执查询</button>
+      </div>
+      <div class="hint">连接备库、等待回放、读取数据三项加起来不超过这个时限；
+        到期或备库不可用就改读主库，结果里会写明原因。</div>
+      <div id="readOut"></div>
+    </section>
+  </div>
+
+  <section class="panel">
+    <h2>主库当前库存</h2>
+    <div id="productsOut" class="muted">加载中…</div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+function el(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined && text !== null) node.textContent = text;
+  return node;
+}
+
+function kv(pairs) {
+  const dl = el("dl", "kv");
+  pairs.forEach(([k, v]) => {
+    dl.appendChild(el("dt", null, k));
+    dl.appendChild(el("dd", null, v === null || v === undefined ? "—" : String(v)));
+  });
+  return dl;
+}
+
+function productTable(products) {
+  const table = el("table");
+  const head = el("tr");
+  ["ID", "名称", "余量", "更新时间"].forEach((t) => head.appendChild(el("th", null, t)));
+  table.appendChild(head);
+  products.forEach((p) => {
+    const tr = el("tr");
+    tr.appendChild(el("td", null, p.product_id));
+    tr.appendChild(el("td", null, p.name));
+    tr.appendChild(el("td", null, p.quantity));
+    tr.appendChild(el("td", null, p.updated_at));
+    table.appendChild(tr);
+  });
+  return table;
+}
+
+function errorBanner(text) {
+  return el("div", "error-banner", text);
+}
+
+// ---------------------------------------------------------------- 商品与备库状态
+
+async function loadProducts() {
+  try {
+    const resp = await fetch("/api/inventory");
+    const data = await resp.json();
+    if (!resp.ok) { $("productsOut").replaceChildren(errorBanner(data.error)); return; }
+    const sel = $("product");
+    const current = sel.value;
+    sel.replaceChildren();
+    data.products.forEach((p) => {
+      const opt = el("option", null, `#${p.product_id} ${p.name}（当前 ${p.quantity}）`);
+      opt.value = p.product_id;
+      sel.appendChild(opt);
+    });
+    if (current && data.products.some((p) => String(p.product_id) === current)) sel.value = current;
+    $("productsOut").replaceChildren(productTable(data.products));
+    if (data.standalone) {
+      $("standbyBadge").className = "badge warn";
+      $("standbyBadge").textContent = "未配置备库";
+    }
+  } catch (e) {
+    $("productsOut").replaceChildren(errorBanner(String(e)));
+  }
+}
+
+async function loadStandby() {
+  try {
+    const resp = await fetch("/api/inventory/standby");
+    const data = await resp.json();
+    const badge = $("standbyBadge");
+    $("standbyKv").replaceChildren();
+    if (!data.available) {
+      badge.className = "badge bad";
+      badge.textContent = data.configured === false ? "未配置备库" : "备库不可用";
+      $("standbyDetail").textContent = data.detail || "";
+      return;
+    }
+    if (!data.in_recovery) {
+      badge.className = "badge warn";
+      badge.textContent = "连接目标不是备库";
+    } else if (data.paused) {
+      badge.className = "badge warn";
+      badge.textContent = "回放已暂停";
+    } else {
+      badge.className = "badge ok";
+      badge.textContent = "回放正常";
+    }
+    $("standbyDetail").textContent = data.pause_state ? `回放状态：${data.pause_state}` : "";
+    $("standbyKv").replaceChildren(...[
+      ["回放位点 replay_lsn", data.replay_lsn],
+      ["接收位点 receive_lsn", data.receive_lsn],
+      ["回放状态", data.pause_state],
+    ].map(([k, v]) => {
+      const frag = document.createDocumentFragment();
+      frag.appendChild(el("dt", null, k));
+      frag.appendChild(el("dd", null, v === null || v === undefined ? "—" : String(v)));
+      return frag;
+    }));
+    const paused = Boolean(data.paused);
+    $("pauseReplay").disabled = paused || !data.in_recovery;
+    $("resumeReplay").disabled = !paused;
+  } catch (e) {
+    $("standbyBadge").className = "badge bad";
+    $("standbyBadge").textContent = "备库状态获取失败";
+    $("standbyDetail").textContent = String(e);
+  }
+}
+
+async function replayAction(action) {
+  $("replayStatus").textContent = action === "pause" ? "正在暂停回放……" : "正在恢复回放……";
+  try {
+    const resp = await fetch("/api/inventory/standby/replay", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) { $("replayStatus").textContent = data.error || ("HTTP " + resp.status); return; }
+    $("replayStatus").textContent = `已${action === "pause" ? "暂停" : "恢复"}回放（${data.pause_state}）`;
+    await loadStandby();
+  } catch (e) {
+    $("replayStatus").textContent = String(e);
+  }
+}
+
+// ---------------------------------------------------------------- 提交更正
+
+function renderReceipt(receipt) {
+  const box = el("div", "receipt-box");
+  box.appendChild(el("div", null, "主库已提交更正，回执已签发："));
+  box.appendChild(kv([
+    ["回执号", receipt.id],
+    ["商品", `#${receipt.product_id}`],
+    ["更正后余量", receipt.quantity],
+    ["更正记录 id", receipt.correction_id],
+    ["提交位点 LSN", receipt.lsn],
+    ["提交时间", receipt.committed_at],
+  ]));
+  return box;
+}
+
+async function submitCorrection() {
+  const productId = Number($("product").value);
+  const quantity = Number($("quantity").value);
+  if (!Number.isInteger(quantity) || quantity < 0) {
+    $("correctionOut").replaceChildren(errorBanner("余量必须是 >= 0 的整数"));
+    return;
+  }
+  $("submitCorrection").disabled = true;
+  $("status").textContent = "提交中……";
+  try {
+    const resp = await fetch("/api/inventory/correction", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ product_id: productId, quantity }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) { $("correctionOut").replaceChildren(errorBanner(data.error || ("HTTP " + resp.status))); return; }
+    $("correctionOut").replaceChildren(renderReceipt(data.receipt));
+    $("token").value = data.receipt.token;
+    $("token").classList.remove("flash");
+    void $("token").offsetWidth;
+    $("token").classList.add("flash");
+    await loadProducts();
+  } catch (e) {
+    $("correctionOut").replaceChildren(errorBanner(String(e)));
+  } finally {
+    $("submitCorrection").disabled = false;
+    $("status").textContent = "";
+  }
+}
+
+// ---------------------------------------------------------------- 按回执读取
+
+const REASON_LABELS = {
+  lagging: "备库回放未追上回执位点",
+  timeout: "共用时限已到",
+  unavailable: "备库不可用",
+  not_standby: "目标不是备库",
+  system_mismatch: "备库实例与回执不匹配",
+  not_found: "备库上没有该商品",
+  standby_not_configured: "未配置备库",
+};
+
+function renderRead(data) {
+  const box = el("div", "result " + data.source);
+  const head = el("div", "row", );
+  head.style.marginTop = "0";
+  if (data.source === "standby") {
+    head.appendChild(el("span", "badge standby", "结果来源：备库"));
+    head.appendChild(el("span", "badge ok", "已回放至回执位点"));
+  } else {
+    head.appendChild(el("span", "badge primary", "结果来源：主库"));
+    head.appendChild(el("span", "badge warn",
+      "备库路径未采用：" + (REASON_LABELS[data.reason] || data.reason)));
+  }
+  box.appendChild(head);
+
+  if (data.product) {
+    const p = data.product;
+    const line = el("div", "row");
+    line.appendChild(el("span", "big", String(p.quantity)));
+    line.appendChild(el("span", "muted", `件 · #${p.product_id} ${p.name}`));
+    line.appendChild(el("span", "badge " + (data.satisfies_receipt ? "ok" : "bad"),
+      data.satisfies_receipt ? "读到本次更正或之后的值" : "读到值早于回执，不符合要求"));
+    box.appendChild(line);
+    box.appendChild(el("div", "hint",
+      `回执记录：更正为 ${data.receipt.quantity} 件（更正记录 #${data.receipt.correction_id}），提交于 ${data.receipt.committed_at}`));
+  }
+
+  box.appendChild(kv([
+    ["读取时 database 位点", data.observed_lsn || data.replay_lsn],
+    ["回执 LSN", data.receipt.lsn],
+    ["备库等待耗时", data.waited_ms === null || data.waited_ms === undefined ? "—" : `${data.waited_ms} ms`],
+    ["共同时限", data.timeout_s === undefined ? "—" : `${data.timeout_s} s`],
+  ]));
+  (data.notes || []).forEach((n) => box.appendChild(el("div", "muted", "· " + n)));
+  if (data.source === "primary") {
+    box.appendChild(el("div", "hint",
+      "回落主库时显示的是主库当前值（可能已被后续更正超过回执）。"));
+  }
+  return box;
+}
+
+async function readByReceipt() {
+  const token = $("token").value.trim();
+  if (!token) { $("readOut").replaceChildren(errorBanner("请先提交更正或粘贴回执")); return; }
+  const timeout_s = parseFloat($("readTimeout").value) || 1;
+  $("readByReceipt").disabled = true;
+  $("readOut").replaceChildren(el("div", "muted", "查询中……（最多约 " + timeout_s + " 秒）"));
+  try {
+    const resp = await fetch("/api/inventory/read", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token, timeout_s }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) { $("readOut").replaceChildren(errorBanner(data.error || ("HTTP " + resp.status))); return; }
+    $("readOut").replaceChildren(renderRead(data));
+  } catch (e) {
+    $("readOut").replaceChildren(errorBanner(String(e)));
+  } finally {
+    $("readByReceipt").disabled = false;
+  }
+}
+
+$("submitCorrection").addEventListener("click", submitCorrection);
+$("readByReceipt").addEventListener("click", readByReceipt);
+$("refreshProducts").addEventListener("click", loadProducts);
+$("pauseReplay").addEventListener("click", () => replayAction("pause"));
+$("resumeReplay").addEventListener("click", () => replayAction("resume"));
+
+loadProducts();
+loadStandby();
+setInterval(loadStandby, 2000);
+</script>
+</body>
+</html>

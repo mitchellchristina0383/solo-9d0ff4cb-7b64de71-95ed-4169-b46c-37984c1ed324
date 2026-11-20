@@ -1,30 +1,91 @@
 services:
-  db:
+  # 主库：沙箱实验（sandbox 库）与库存演示（inventory 库）都写这里
+  db-primary:
     image: postgres:16
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - max_wal_senders=10
+      - -c
+      - wal_keep_size=64MB
+      - -c
+      - hot_standby=on
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: sandbox
       POSTGRES_DB: sandbox
+      REPLICATION_USER: replicator
+      REPLICATION_PASSWORD: replicator
+    volumes:
+      - pg-primary:/var/lib/postgresql/data
+      - ./docker/primary-init.sh:/docker-entrypoint-initdb.d/10-replication.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d sandbox"]
       interval: 1s
       timeout: 3s
       retries: 30
-    # 纯沙箱：数据每轮都会被“初始数据 SQL”重置，不挂卷，删掉容器即清空
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  # 备库：流复制 + 热备只读；页面上的“暂停/恢复回放”就是操作这个实例
+  db-standby:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: sandbox
+      POSTGRES_DB: sandbox
+      PRIMARY_HOST: db-primary
+      PRIMARY_PORT: "5432"
+      REPLICATION_USER: replicator
+      REPLICATION_PASSWORD: replicator
+    entrypoint: ["/usr/local/bin/standby-entrypoint.sh"]
+    volumes:
+      - pg-standby:/var/lib/postgresql/data
+      - ./docker/standby-entrypoint.sh:/usr/local/bin/standby-entrypoint.sh:ro
+    depends_on:
+      db-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d inventory"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+    ports:
+      - "127.0.0.1:5433:5432"
 
   web:
     build:
       context: .
       dockerfile: app/Dockerfile
     environment:
-      PGHOST: db
+      PGHOST: db-primary
       PGPORT: "5432"
       PGDATABASE: sandbox
       PGUSER: postgres
       PGPASSWORD: sandbox
       PORT: "8080"
+      # 库存主备；备库单独指向流复制备库
+      INVENTORY_PRIMARY_HOST: db-primary
+      INVENTORY_PRIMARY_PORT: "5432"
+      INVENTORY_PRIMARY_DATABASE: inventory
+      INVENTORY_PRIMARY_USER: postgres
+      INVENTORY_PRIMARY_PASSWORD: sandbox
+      INVENTORY_STANDBY_HOST: db-standby
+      INVENTORY_STANDBY_PORT: "5432"
+      INVENTORY_STANDBY_DATABASE: inventory
+      INVENTORY_STANDBY_USER: postgres
+      INVENTORY_STANDBY_PASSWORD: sandbox
+      # 固定密钥：web 重启后旧回执仍可校验（演示用，生产应换成密管）
+      INVENTORY_SECRET: local-dev-receipt-secret
     ports:
       - "127.0.0.1:8080:8080"
     depends_on:
-      db:
+      db-primary:
         condition: service_healthy
+
+volumes:
+  # 主备各有独立数据卷；主库卷被重建时备库实例标识会与回执不符，代码会拒绝读备库并回落主库。
+  pg-primary:
+  pg-standby:

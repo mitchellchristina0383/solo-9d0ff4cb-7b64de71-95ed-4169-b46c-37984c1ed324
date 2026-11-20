@@ -1,6 +1,7 @@
-# 并发写入观测台（隔离级别沙箱）
+# 并发写入观测台（隔离级别沙箱）与库存主备读
 
 给数据库工程师的一个小工具：在改隔离级别之前，先看看**同一组并发写入**在不同隔离级别下会留下什么数据。
+另外带一个**库存入口**：更正写主库、拿回执，凭回执查时优先读备库，确认备库已回放这笔提交才返回备库结果。
 
 两个会话（A、B）按可编辑的脚本交错执行 SQL。同一组脚本、同一份初始数据，分别在
 **READ COMMITTED** 和 **SERIALIZABLE** 下各跑一轮，页面上并排展示：
@@ -26,8 +27,55 @@ docker compose up --build
 # 打开 http://localhost:8080
 ```
 
-`web` 依赖 `db` 的健康检查，数据库就绪后页面即可用。端口默认 `127.0.0.1:8080`
+`web` 依赖 `db-primary` 的健康检查，数据库就绪后页面即可用。端口默认 `127.0.0.1:8080`
 （本工具不做任何鉴权，会原样执行你贴的 SQL，请勿暴露到公共网络）。
+
+`docker compose up` 会起三个服务（首次启动备库要等 `pg_basebackup` 克隆完成）：
+
+| 服务 | 作用 | 宿主端口 |
+| --- | --- | --- |
+| `db-primary` | PostgreSQL 16 主库：沙箱库 `sandbox` + 库存库 `inventory` | `127.0.0.1:5432` |
+| `db-standby` | 流复制备库（热备只读），页面上的暂停/恢复回放操作它 | `127.0.0.1:5433` |
+| `web` | Flask 页面与接口 | `127.0.0.1:8080` |
+
+主库首次初始化时由 `docker/primary-init.sh` 建复制账号 `replicator` 和 `inventory` 库；
+备库首次启动由 `docker/standby-entrypoint.sh` 用 `pg_basebackup -R` 克隆主库再以备库身份启动，
+之后重启直接沿用数据卷。
+
+## 库存入口：回执 + 主备一致读
+
+页面 `/inventory`（首页顶部有入口）：
+
+1. **更正余量（写主库）**：`UPDATE inventory` 与 `inventory_corrections` 流水在同一事务提交。
+   提交成功后取主库 `pg_current_wal_insert_lsn()`（提交记录之后的 WAL 插入位置），
+   连同商品、余量、更正记录 id、主库实例标识一起签成 **回执**（HMAC-SHA256）。
+2. **凭回执查商品（先备库）**：解码并校验回执 → 连备库 → 等回放 →
+   `pg_last_wal_replay_lsn() >= 回执 LSN` 才读库存。连接、等回放、取数**共用同一个时限**
+   （页面可设，默认 1 秒，最大 30 秒）。
+3. **兜底**：时限到期、备库连不上、目标不是备库、实例标识不符等任何一项不满足，
+   都改读主库，页面明确标注 `结果来源：主库` 和未采用备库的原因；
+   读到备库时标注 `结果来源：备库` 与等待耗时。
+
+一致性判据的细节：
+
+- 回执 LSN 用**插入位置**而不是 flush 位置。`synchronous_commit=off` 时 flush LSN 可能落后，
+  两个不同更正会拿到同一个位点，备库据此可能读到旧值——本地实测复现过，已修正。
+- 取数放在一个 `REPEATABLE READ READ ONLY` 事务里：事务内先读 `pg_last_wal_replay_lsn()`，
+  再读库存与最近更正 id。只认“读之前已回放到位”，不靠页面展示的瞬时位点。
+- 回执带主库 `system_identifier`：主库卷被重建后旧回执不可用于新实例的备库判断
+  （实例标识不符 → 回落主库）。
+- 页面上的“读到本次更正或之后的值”按**更正流水 id** 判断：结果快照里该商品最新一条更正
+  `id >= 回执.correction_id`。回执之后又有别的更正时，读到更新的值同样满足要求。
+- 回执签名只防篡改 WAL 位置（避免客户端把“读备库”骗到任意旧位点），不是身份认证；
+  `INVENTORY_SECRET` 未设置时每次启动随机生成，重启后旧回执失效（Compose 里给了固定值）。
+
+### 环境变量
+
+| 变量 | 含义 |
+| --- | --- |
+| `INVENTORY_PRIMARY_HOST/_PORT/_DATABASE/_USER/_PASSWORD` | 主库连接（未设置时回落到 `PGHOST` 等） |
+| `INVENTORY_STANDBY_HOST/_PORT/_DATABASE/_USER/_PASSWORD` | 备库连接；一个都没设则视为“未配置备库”，直接读主库 |
+| `INVENTORY_SECRET` | 回执签名密钥 |
 
 ## 页面与脚本语法
 
@@ -78,13 +126,20 @@ COMMIT;
 ```bash
 docker compose up -d --build
 docker compose exec web python tests/selftest.py
+docker compose exec web python tests/inventory_selftest.py
 ```
+
+`inventory_selftest.py` 覆盖：回执签发/篡改拒绝、LSN 单调递增、备库滞后时回落主库、
+恢复后读到备库、暂停期间连续更正、备库断连回落、连接目标是主库时拒绝当备库读。
+它通过环境变量取主备连接（容器里已由 Compose 注入）。
 
 也可以对着任意可达的 PostgreSQL 跑：
 
 ```bash
 pip install -r app/requirements.txt
 PGHOST=... PGDATABASE=... PGUSER=... PGPASSWORD=... python tests/selftest.py
+PYTHONPATH=app INVENTORY_PRIMARY_HOST=... INVENTORY_STANDBY_HOST=... \
+  python tests/inventory_selftest.py
 ```
 
 ## 实现要点
@@ -96,9 +151,11 @@ PGHOST=... PGDATABASE=... PGUSER=... PGPASSWORD=... python tests/selftest.py
 - 事务结局以服务器命令标签为准：`COMMIT` 一个已失败的事务时 PostgreSQL 实际返回
   `ROLLBACK`，页面会如实显示为回滚；`40001` / `40P01` 记为“已中止”。
 - `app/script_parser.py`：`@A complete` / `@B blocked` 头部解析，带行号报错。
-- `app/main.py`：Flask 页面与 `/api/run`。所有请求共用一个沙箱库，同一时刻只允许
-  一轮实验在跑（其余请求收到 409）。
-- `tests/selftest.py`：上面的端到端自测。
+- `app/main.py`：Flask 页面与接口。所有沙箱实验请求共用一个库，同一时刻只允许
+  一轮实验在跑（其余请求收到 409）；`/api/inventory*` 是库存入口。
+- `app/inventory.py`：主库更正与回执签发、备库等回放读、暂停/恢复回放、备库状态。
+- `app/receipts.py`：回执编解码与签名校验。
+- `tests/selftest.py`、`tests/inventory_selftest.py`：上面的端到端自测。
 
 ## 限制与说明
 
@@ -106,4 +163,8 @@ PGHOST=... PGDATABASE=... PGUSER=... PGPASSWORD=... python tests/selftest.py
 - 引擎**不会**自动重试 40001（重试策略属于应用层，可在脚本里自行表达）；
 - 单步可含多条语句，但只展示最后一条的结果；
 - 初始数据 SQL 在 `postgres` 超级用户下执行，能力不设限——这是本地沙箱，不是多租户服务；
-- 数据不持久化：每轮重置，容器删除即清空。
+- 数据不持久化：沙箱库每轮重置；库存库在主备数据卷里，`docker compose down -v` 即清空；
+- 主备是演示级配置：无鉴权、复制槽未固定（`wal_keep_size` 兜底）、无故障切换；
+  备库故障时需要手动恢复（`docker compose restart db-standby` 或重建数据卷重新克隆）。
+- 回执只保证“读到这次更正或之后”，不提供跨商品的全局快照一致性；
+  备库结果通过回放位点判断，不作同步复制的强一致承诺。
